@@ -179,7 +179,8 @@ def main() -> None:
                         "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(installer),
                         "/win32manifest:" + str(ROOT / "src/FastmeanRuRunner.manifest"),
                         "/resource:" + str(payload_path) + ",FastmeanRussianUI.Payload",
-                        str(ROOT / "src/Installer.cs"), str(ROOT / "src/FastmeanLaunchPaths.cs"), str(assembly_info)], check=True)
+                        str(ROOT / "src/Installer.cs"), str(ROOT / "src/FastmeanLaunchPaths.cs"),
+                        str(ROOT / "src/UnicodeShortcut.cs"), str(assembly_info)], check=True)
     (output / "FASTMEAN-RussianUI-Source.zip").write_bytes(source_zip)
     products = [installer, output / "FASTMEAN-RussianUI-Source.zip"]
     (output / "SHA256SUMS.txt").write_text("".join(digest(p.read_bytes()) + "  " + p.name + "\n" for p in products), encoding="ascii")

@@ -2,6 +2,7 @@
 
 Only managed installer CLI and runner --check are executed. FASTMEAN, Locale
 Emulator and normal runner launch paths are never started by these tests.
+The Windows Shell shortcut round trip saves only in a disposable test directory.
 """
 from __future__ import annotations
 
@@ -34,10 +35,13 @@ internal static class ManagedHarness
 {
     private static object Call(string name, params object[] args)
     {
-        return typeof(Installer).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static)
-            .Invoke(null, args);
+        foreach (MethodInfo method in typeof(Installer).GetMethods(BindingFlags.NonPublic | BindingFlags.Static))
+            if (method.Name == name && method.GetParameters().Length == args.Length)
+                return method.Invoke(null, args);
+        throw new Exception("Managed test method not found: " + name);
     }
 
+    [STAThread]
     public static int Main(string[] args)
     {
         object result;
@@ -50,6 +54,27 @@ internal static class ManagedHarness
                 failure = (string)Call("CompletionText", args[1], null, message),
                 without_shortcut = (string)Call("CompletionText", args[1], null, null),
                 success = (string)Call("CompletionText", args[1], "private-desktop-shortcut.lnk", null) };
+        }
+        else if (args[0] == "shortcut")
+        {
+            Installer.Receipt receipt = new Installer.Receipt();
+            Call("CreateShortcut", args[1], receipt, args[2]);
+            object instance = Activator.CreateInstance(Type.GetTypeFromCLSID(
+                new Guid("00021401-0000-0000-C000-000000000046"), true));
+            try
+            {
+                ((System.Runtime.InteropServices.ComTypes.IPersistFile)instance).Load(receipt.shortcut, 0);
+                var link = (UnicodeShortcut.IShellLinkW)instance;
+                var target = new StringBuilder(1024);
+                var directory = new StringBuilder(1024);
+                var description = new StringBuilder(1024);
+                link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
+                link.GetWorkingDirectory(directory, directory.Capacity);
+                link.GetDescription(description, description.Capacity);
+                result = new { ok = true, shortcut = receipt.shortcut, shortcut_sha256 = receipt.shortcut_sha256,
+                    target = target.ToString(), directory = directory.ToString(), description = description.ToString() };
+            }
+            finally { Marshal.FinalReleaseComObject(instance); }
         }
         else
         {
@@ -224,7 +249,7 @@ class InstallerTests(unittest.TestCase):
         self.install()
         required = {"FastmeanRuRunner.exe", "LoaderDll.dll", "LocaleEmulator.dll", "FASTMEAN_EXE.txt",
                     "installation.json", "source/src/FastmeanRuRunner.cs", "source/src/FastmeanLaunchPaths.cs",
-                    "source/src/Installer.cs", "source/build.py", "source/NOTICE.md",
+                    "source/src/Installer.cs", "source/src/UnicodeShortcut.cs", "source/build.py", "source/NOTICE.md",
                     "source/licenses/COPYING", "source/licenses/COPYING.LESSER"}
         self.assertTrue(all((self.destination / name).is_file() for name in required))
         receipt = json.loads((self.destination / "installation.json").read_text(encoding="utf-8"))
@@ -346,7 +371,8 @@ class InstallerTests(unittest.TestCase):
             "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(executable),
             "/win32manifest:" + str(PROJECT / "src/FastmeanRuRunner.manifest"),
             "/resource:" + str(payload) + ",FastmeanRussianUI.Payload",
-            str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs")]
+            str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs"),
+            str(PROJECT / "src/UnicodeShortcut.cs")]
         try:
             compiled = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -397,7 +423,8 @@ class InstallerTests(unittest.TestCase):
             "/reference:System.Windows.Forms.dll", "/reference:System.Drawing.dll",
             "/reference:System.Web.Extensions.dll", "/reference:System.IO.Compression.dll",
             "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(executable),
-            str(source), str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs")]
+            str(source), str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs"),
+            str(PROJECT / "src/UnicodeShortcut.cs")]
         try:
             compiled = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -434,6 +461,30 @@ class InstallerTests(unittest.TestCase):
         self.assertIs(result["partial_write_reached"], True)
         self.assertEqual(snapshot(self.destination), before)
         self.assertFalse(list(self.case.glob(".fastmean-russian-ui-*")))
+
+    def test_shell_link_round_trip_preserves_cyrillic_names_and_contents_without_launching(self):
+        executable = self.compile_managed_harness()
+        helper_root = self.case / "Русский запускатель"
+        helper_root.mkdir()
+        helper = helper_root / "FastmeanRuRunner.exe"
+        helper.write_bytes(EXE_FIXTURE)
+        desktop = self.case / "Рабочий стол"
+        desktop.mkdir()
+        unknown = desktop / "FASTMEAN (русский).lnk"
+        unknown.write_bytes(b"unknown existing shortcut fixture; preserve")
+        original = unknown.read_bytes()
+        result = self.run_cli(["shortcut", helper_root, desktop], executable=executable)
+        shortcut = desktop / "FASTMEAN (русский) 2.lnk"
+        self.assertEqual(Path(result["shortcut"]), shortcut)
+        self.assertTrue(shortcut.is_file())
+        self.assertGreater(shortcut.stat().st_size, 76)
+        self.assertEqual(result["shortcut_sha256"], sha256(shortcut.read_bytes()))
+        self.assertEqual(Path(result["target"]), helper)
+        self.assertEqual(Path(result["directory"]), helper_root)
+        self.assertEqual(result["description"], "FASTMEAN — русский интерфейс и ввод")
+        self.assertEqual(helper.read_bytes(), EXE_FIXTURE)
+        self.assertEqual(unknown.read_bytes(), original)
+        self.assertEqual(sorted(path.name for path in desktop.iterdir()), sorted([unknown.name, shortcut.name]))
 
     def make_junction(self, link, target):
         shell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"

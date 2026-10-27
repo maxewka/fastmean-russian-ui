@@ -388,7 +388,11 @@ internal static class Installer
 
     private static void CreateShortcut(string root, Receipt receipt)
     {
-        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        CreateShortcut(root, receipt, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+    }
+
+    private static void CreateShortcut(string root, Receipt receipt, string desktop)
+    {
         string shortcut = receipt.shortcut;
         if (String.IsNullOrEmpty(shortcut) || !File.Exists(shortcut) || FileHash(shortcut) != receipt.shortcut_sha256)
         {
@@ -397,15 +401,8 @@ internal static class Installer
                 shortcut = Path.Combine(desktop, "FASTMEAN (русский) " + index + ".lnk");
         }
         NoLinks(shortcut);
-        Type type = Type.GetTypeFromProgID("WScript.Shell", true);
-        object shell = Activator.CreateInstance(type);
-        object link = type.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { shortcut });
-        Type linkType = link.GetType();
         string helper = Path.Combine(root, "FastmeanRuRunner.exe");
-        linkType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, link, new object[] { helper });
-        linkType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, link, new object[] { root });
-        linkType.InvokeMember("Description", BindingFlags.SetProperty, null, link, new object[] { "FASTMEAN — русский интерфейс и ввод" });
-        linkType.InvokeMember("Save", BindingFlags.InvokeMethod, null, link, null);
+        UnicodeShortcut.Save(shortcut, helper, root, "FASTMEAN — русский интерфейс и ввод");
         receipt.shortcut = shortcut;
         receipt.shortcut_sha256 = FileHash(shortcut);
     }
