@@ -20,6 +20,12 @@ configuration and no-launch diagnostic checks. This standalone project adds a
 per-user one-click installer and source/release build orchestration. It was
 separated from FASTMEAN MCP on 2026-10-27.
 
+Version 1.0.1 adds a bounded upgrade repair for an already selected helper's SCM
+open command, with backups and compare-before-restore ownership. It also adds
+original LGPL helper icon artwork and runtime display of the separately
+installed native application's icon. Native FASTMEAN icon pixels are not
+redistributed in this project; see assets/README.md.
+
 The builder uses the unmodified official v2.5.0.1 Locale Emulator release and
 verifies pinned SHA256 values before packaging `LoaderDll.dll` and
 `LocaleEmulator.dll`. Generated binaries are not tracked by Git. Licensed release

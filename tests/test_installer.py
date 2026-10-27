@@ -33,6 +33,157 @@ using System.Web.Script.Serialization;
 
 internal static class ManagedHarness
 {
+    private sealed class MemoryStore : HelperAssociation.IStore
+    {
+        internal Dictionary<string, HelperAssociation.Value> Values =
+            new Dictionary<string, HelperAssociation.Value>(StringComparer.OrdinalIgnoreCase);
+        internal int Writes;
+        internal Action<HelperAssociation.Value> BeforeWrite;
+        internal Action<HelperAssociation.Value> AfterWrite;
+        internal void Set(string key, string name, string value)
+        { Values[key + "|" + name] = new HelperAssociation.Value(value, 1); }
+        public HelperAssociation.Value Read(string key, string name)
+        {
+            HelperAssociation.Value value;
+            return Values.TryGetValue(key + "|" + name, out value)
+                ? new HelperAssociation.Value(value.text, value.kind) : null;
+        }
+        public void Write(string key, string name, HelperAssociation.Value value)
+        {
+            Check(key == HelperAssociation.CommandKey && name == String.Empty,
+                "Installer attempted a registry write outside the existing helper command");
+            Writes++;
+            if (BeforeWrite != null) BeforeWrite(value);
+            Values[key + "|" + name] = new HelperAssociation.Value(value.text, value.kind);
+            if (AfterWrite != null) AfterWrite(value);
+        }
+    }
+
+    private static void Check(bool condition, string message)
+    { if (!condition) throw new Exception(message); }
+
+    private static object FixtureBundle()
+    {
+        Type bundleType = typeof(Installer).GetNestedType("Bundle", BindingFlags.NonPublic);
+        object bundle = Activator.CreateInstance(bundleType, true);
+        bundleType.GetField("Version", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(bundle, "9.0.0");
+        var files = (Dictionary<string, byte[]>)bundleType.GetField("Files", BindingFlags.NonPublic | BindingFlags.Instance)
+            .GetValue(bundle);
+        files.Add("FastmeanRuRunner.exe", Encoding.UTF8.GetBytes("replacement fixture, never execute"));
+        files.Add("LoaderDll.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
+        files.Add("LocaleEmulator.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
+        return bundle;
+    }
+
+    private static object AssociationFlow(string mode, string root, string target)
+    {
+        object bundle = FixtureBundle();
+        MemoryStore store = new MemoryStore();
+        string original = HelperAssociation.Command(Path.Combine(Path.GetDirectoryName(target),
+            "RussianRuntime", "FastmeanRuRunner.exe"));
+        string installedCommand = HelperAssociation.Command(Path.Combine(root, "FastmeanRuRunner.exe"));
+        store.Set(HelperAssociation.LatestChoiceKey, "ProgId", HelperAssociation.HelperProgId);
+        store.Set(HelperAssociation.CommandKey, String.Empty, original);
+        store.Set(HelperAssociation.LatestChoiceKey, "Hash", "protected choice hash fixture");
+        int notifications = 0;
+        Action notify = delegate { notifications++; };
+        JavaScriptSerializer json = new JavaScriptSerializer();
+        string receiptPath = Path.Combine(root, "installation.json");
+        int prewriteBackups = 0;
+        bool injectedFailure = false;
+        store.AfterWrite = delegate(HelperAssociation.Value value)
+        {
+            if (value.text == installedCommand)
+            {
+                string[] backups = Directory.GetFiles(Path.Combine(root, "association-backups"), "*.json");
+                Check(backups.Length == 1, "Association was changed before saving its durable backup");
+                var saved = json.Deserialize<HelperAssociation.Receipt>(File.ReadAllText(backups[0]));
+                Check(saved.original.text == original && saved.installed.text == installedCommand,
+                    "Durable backup contains wrong original/new command");
+                prewriteBackups++;
+                if (mode == "association-recovery")
+                    throw new IOException("deliberate failure after registration commit");
+                if (mode == "association-failure")
+                {
+                    File.SetAttributes(receiptPath, File.GetAttributes(receiptPath) | FileAttributes.ReadOnly);
+                    injectedFailure = true;
+                }
+            }
+            else if (injectedFailure && value.text == original)
+                File.SetAttributes(receiptPath, File.GetAttributes(receiptPath) & ~FileAttributes.ReadOnly);
+        };
+        if (mode == "association-recovery")
+        {
+            store.BeforeWrite = delegate(HelperAssociation.Value value) {
+                if (value.text == original) throw new IOException("deliberate registration restore failure");
+            };
+            bool recoveryRequired = false;
+            try { Call("InstallCore", root, target, bundle, true,
+                (Action<string, string, bool>)File.Copy, store, notify); }
+            catch (TargetInvocationException error)
+            {
+                recoveryRequired = error.InnerException.GetType().Name == "AssociationRecoveryException";
+            }
+            Check(recoveryRequired && store.Read(HelperAssociation.CommandKey, String.Empty).text == installedCommand,
+                "Uncertain association state was not reported as requiring recovery");
+            Check(File.ReadAllText(Path.Combine(root, "FastmeanRuRunner.exe")) == "replacement fixture, never execute",
+                "The helper still selected by Windows was removed or rolled back");
+            Check(Directory.GetFiles(Path.Combine(root, "association-backups"), "*.json").Length == 1,
+                "The recovery backup was not preserved");
+            return new { ok = true, recovery_required = true, helper_preserved = true,
+                backup_count = prewriteBackups };
+        }
+        if (mode == "association-failure")
+        {
+            bool failed = false;
+            try { Call("InstallCore", root, target, bundle, true,
+                (Action<string, string, bool>)File.Copy, store, notify); }
+            catch (TargetInvocationException error)
+            {
+                Check(error.GetBaseException() is UnauthorizedAccessException,
+                    "Unexpected simulated receipt-write failure: " + error.GetBaseException());
+                failed = true;
+            }
+            Check(failed && injectedFailure && store.Writes == 2 && prewriteBackups == 1,
+                "Receipt failure did not reach and roll back the association update");
+            Check(store.Read(HelperAssociation.CommandKey, String.Empty).text == original,
+                "Failed install left the new association registered");
+            return new { ok = true, rolled_back = true, registry_writes = store.Writes,
+                notification_count = notifications, backup_count = prewriteBackups };
+        }
+
+        object installed = Call("InstallCore", root, target, bundle, true,
+            (Action<string, string, bool>)File.Copy, store, notify);
+        Installer.Receipt receipt = json.Deserialize<Installer.Receipt>(File.ReadAllText(receiptPath));
+        Check(receipt.association != null && receipt.association.original.text == original,
+            "Installer receipt did not retain association ownership");
+        Check(store.Writes == 1 && notifications == 1 && prewriteBackups == 1,
+            "Initial repair did not perform one backed-up write and notification");
+        string backupPath = Path.Combine(root, receipt.association_backup.Replace('/', Path.DirectorySeparatorChar));
+        byte[] backupBytes = File.ReadAllBytes(backupPath);
+        object second = Call("InstallCore", root, target, bundle, true,
+            (Action<string, string, bool>)File.Copy, store, notify);
+        Installer.Receipt secondReceipt = json.Deserialize<Installer.Receipt>(File.ReadAllText(receiptPath));
+        Check(store.Writes == 1 && notifications == 2 && prewriteBackups == 1,
+            "Idempotent upgrade rewrote the registration or failed to refresh its icon");
+        Check(secondReceipt.association.original.text == original &&
+            secondReceipt.association_backup == receipt.association_backup,
+            "Idempotent upgrade lost the original backup or ownership");
+        if (mode == "association-external")
+            store.Set(HelperAssociation.CommandKey, String.Empty, "user changed this helper command");
+        object uninstalled = Call("Uninstall", root, bundle, store, notify);
+        string finalCommand = store.Read(HelperAssociation.CommandKey, String.Empty).text;
+        Check(finalCommand == (mode == "association-external" ? "user changed this helper command" : original),
+            "Uninstall restored an external edit or failed to restore the owned command");
+        Check(File.Exists(backupPath) && Convert.ToBase64String(File.ReadAllBytes(backupPath)) ==
+            Convert.ToBase64String(backupBytes), "Uninstall removed or changed the private backup");
+        Check(store.Read(HelperAssociation.LatestChoiceKey, "Hash").text == "protected choice hash fixture",
+            "Installer changed a protected choice hash");
+        return new { ok = true, installed = installed, idempotent = second, uninstalled = uninstalled,
+            backup = backupPath, registry_writes = store.Writes, notification_count = notifications,
+            original_command = original, final_command = finalCommand };
+    }
+
     private static object Call(string name, params object[] args)
     {
         foreach (MethodInfo method in typeof(Installer).GetMethods(BindingFlags.NonPublic | BindingFlags.Static))
@@ -68,24 +219,36 @@ internal static class ManagedHarness
                 var target = new StringBuilder(1024);
                 var directory = new StringBuilder(1024);
                 var description = new StringBuilder(1024);
+                var iconPath = new StringBuilder(1024);
+                int iconIndex;
                 link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
                 link.GetWorkingDirectory(directory, directory.Capacity);
                 link.GetDescription(description, description.Capacity);
+                link.GetIconLocation(iconPath, iconPath.Capacity, out iconIndex);
                 result = new { ok = true, shortcut = receipt.shortcut, shortcut_sha256 = receipt.shortcut_sha256,
-                    target = target.ToString(), directory = directory.ToString(), description = description.ToString() };
+                    target = target.ToString(), directory = directory.ToString(), description = description.ToString(),
+                    icon_path = iconPath.ToString(), icon_index = iconIndex };
             }
             finally { Marshal.FinalReleaseComObject(instance); }
         }
+        else if (args[0].StartsWith("association-", StringComparison.Ordinal))
+            result = AssociationFlow(args[0], args[1], args[2]);
+        else if (args[0] == "completion-preview")
+        {
+            // UI-only preview for an explicitly requested manual screenshot.
+            // Does not install, register anything, or click Open/Uninstall.
+            Type resultType = typeof(Installer).GetNestedType("InstallResult", BindingFlags.NonPublic);
+            object installed = Activator.CreateInstance(resultType, true);
+            resultType.GetField("version").SetValue(installed, "1.0.1");
+            resultType.GetField("target").SetValue(installed, args[2]);
+            resultType.GetField("helper").SetValue(installed, Path.Combine(args[1], "FastmeanRuRunner.exe"));
+            resultType.GetField("file_association_status").SetValue(installed, "updated_existing_helper");
+            Call("ShowCompletion", args[1], FixtureBundle(), installed);
+            result = new { ok = true, preview_only = true, native_launch_started = false };
+        }
         else
         {
-            Type bundleType = typeof(Installer).GetNestedType("Bundle", BindingFlags.NonPublic);
-            object bundle = Activator.CreateInstance(bundleType, true);
-            bundleType.GetField("Version", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(bundle, "9.0.0");
-            var files = (Dictionary<string, byte[]>)bundleType.GetField("Files", BindingFlags.NonPublic | BindingFlags.Instance)
-                .GetValue(bundle);
-            files.Add("FastmeanRuRunner.exe", Encoding.UTF8.GetBytes("replacement fixture, never execute"));
-            files.Add("LoaderDll.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
-            files.Add("LocaleEmulator.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
+            object bundle = FixtureBundle();
             bool partialWrite = false;
             Action<string, string, bool> copier = delegate(string source, string destination, bool overwrite)
             {
@@ -99,7 +262,8 @@ internal static class ManagedHarness
             };
             MethodInfo install = null;
             foreach (MethodInfo method in typeof(Installer).GetMethods(BindingFlags.NonPublic | BindingFlags.Static))
-                if (method.Name == "Install" && method.GetParameters().Length == 5) install = method;
+                if (method.Name == "Install" && method.GetParameters().Length == 5 &&
+                    method.GetParameters()[4].ParameterType == typeof(Action<string, string, bool>)) install = method;
             if (install == null) throw new Exception("Transactional copy entry point not found");
             try
             {
@@ -221,7 +385,7 @@ class InstallerTests(unittest.TestCase):
         return data
 
     def options(self, mode="--install", destination=None):
-        return [mode, "--json", "--no-shortcuts", "--app-dir", self.application,
+        return [mode, "--json", "--no-shortcuts", "--no-association-update", "--app-dir", self.application,
                 "--destination", destination or self.destination]
 
     def install(self):
@@ -372,7 +536,8 @@ class InstallerTests(unittest.TestCase):
             "/win32manifest:" + str(PROJECT / "src/FastmeanRuRunner.manifest"),
             "/resource:" + str(payload) + ",FastmeanRussianUI.Payload",
             str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs"),
-            str(PROJECT / "src/UnicodeShortcut.cs")]
+            str(PROJECT / "src/UnicodeShortcut.cs"), str(PROJECT / "src/HelperAssociation.cs"),
+            str(PROJECT / "src/AppBranding.cs")]
         try:
             compiled = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -424,7 +589,8 @@ class InstallerTests(unittest.TestCase):
             "/reference:System.Web.Extensions.dll", "/reference:System.IO.Compression.dll",
             "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(executable),
             str(source), str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs"),
-            str(PROJECT / "src/UnicodeShortcut.cs")]
+            str(PROJECT / "src/UnicodeShortcut.cs"), str(PROJECT / "src/HelperAssociation.cs"),
+            str(PROJECT / "src/AppBranding.cs")]
         try:
             compiled = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -462,6 +628,53 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(snapshot(self.destination), before)
         self.assertFalse(list(self.case.glob(".fastmean-russian-ui-*")))
 
+    def test_installer_repairs_selected_legacy_helper_and_uninstall_restores_backed_up_command(self):
+        executable = self.compile_managed_harness()
+        result = self.run_cli(["association-upgrade", self.destination, self.target], executable=executable)
+        self.assertIs(result["installed"]["file_association_changed"], True)
+        self.assertEqual(result["installed"]["file_association_status"], "updated_existing_helper")
+        self.assertIs(result["idempotent"]["file_association_changed"], False)
+        self.assertEqual(result["idempotent"]["file_association_status"], "already_current")
+        self.assertIs(result["uninstalled"]["file_association_changed"], True)
+        self.assertEqual(result["registry_writes"], 2)
+        self.assertEqual(result["notification_count"], 3)
+        self.assertEqual(result["final_command"], result["original_command"])
+        self.assertTrue(Path(result["backup"]).is_file())
+        self.assertEqual(sorted(snapshot(self.destination)), ["association-backups", "association-backups/" + Path(result["backup"]).name])
+
+    def test_installer_uninstall_preserves_external_helper_command_edit_and_private_backup(self):
+        executable = self.compile_managed_harness()
+        result = self.run_cli(["association-external", self.destination, self.target], executable=executable)
+        self.assertIs(result["uninstalled"]["file_association_changed"], False)
+        self.assertEqual(result["final_command"], "user changed this helper command")
+        self.assertEqual(result["registry_writes"], 1)
+        self.assertEqual(result["notification_count"], 2)
+        self.assertTrue(Path(result["backup"]).is_file())
+        self.assertFalse((self.destination / "FastmeanRuRunner.exe").exists())
+
+    def test_final_receipt_write_failure_rolls_back_association_and_existing_installed_files(self):
+        self.install()
+        executable = self.compile_managed_harness()
+        before = snapshot(self.destination)
+        result = self.run_cli(["association-failure", self.destination, self.target], executable=executable)
+        self.assertIs(result["rolled_back"], True)
+        self.assertEqual(result["registry_writes"], 2)
+        self.assertEqual(result["notification_count"], 1)
+        after = {name: value for name, value in snapshot(self.destination).items()
+                 if name != "association-backups" and not name.startswith("association-backups/")}
+        self.assertEqual(after, before)
+        self.assertEqual(len(list((self.destination / "association-backups").glob("*.json"))), 1)
+        self.assertFalse(list(self.case.glob(".fastmean-russian-ui-*")))
+
+    def test_uncertain_association_restore_keeps_the_selected_new_helper_and_recovery_backup(self):
+        self.install()
+        executable = self.compile_managed_harness()
+        result = self.run_cli(["association-recovery", self.destination, self.target], executable=executable)
+        self.assertIs(result["recovery_required"], True)
+        self.assertIs(result["helper_preserved"], True)
+        self.assertEqual(result["backup_count"], 1)
+        self.assertEqual(len(list((self.destination / "association-backups").glob("*.json"))), 1)
+
     def test_shell_link_round_trip_preserves_cyrillic_names_and_contents_without_launching(self):
         executable = self.compile_managed_harness()
         helper_root = self.case / "Русский запускатель"
@@ -479,6 +692,8 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(shortcut.is_file())
         self.assertGreater(shortcut.stat().st_size, 76)
         self.assertEqual(result["shortcut_sha256"], sha256(shortcut.read_bytes()))
+        self.assertEqual(Path(result["icon_path"]), helper)
+        self.assertEqual(result["icon_index"], 0)
         self.assertEqual(Path(result["target"]), helper)
         self.assertEqual(Path(result["directory"]), helper_root)
         self.assertEqual(result["description"], "FASTMEAN — русский интерфейс и ввод")

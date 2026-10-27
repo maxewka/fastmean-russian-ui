@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-only
-// Per-user installer. No registry, locale, policy, elevation or native-app writes.
+// Per-user installer. Repairs only an already selected helper registration;
+// no UserChoice/hash, locale, policy, elevation or native-application writes.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -7,6 +8,7 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Web.Script.Serialization;
@@ -29,11 +31,13 @@ internal static class Installer
     {
         public string owner, version, target, shortcut, shortcut_sha256;
         public Entry[] files;
+        public HelperAssociation.Receipt association;
+        public string association_backup;
     }
     private sealed class Options
     {
         internal string Mode = "install", AppDir, Destination;
-        internal bool JsonOutput, NoShortcuts, Interactive;
+        internal bool JsonOutput, NoShortcuts, NoAssociationUpdate, Interactive;
     }
     private sealed class Bundle
     {
@@ -45,6 +49,12 @@ internal static class Installer
         public bool ok = true, file_association_changed = false,
             windows_settings_changed = false, native_launch_started = false;
         public string status = "installed", version, install_dir, helper, target, shortcut, shortcut_error;
+        public string file_association_status, association_backup;
+    }
+
+    private sealed class AssociationRecoveryException : IOException
+    {
+        internal AssociationRecoveryException(string message, Exception cause) : base(message, cause) { }
     }
 
     [STAThread]
@@ -58,7 +68,8 @@ internal static class Installer
             string root = InstallRoot(options.Destination);
             object result;
             InstallResult installed = null;
-            if (options.Mode == "uninstall") result = Uninstall(root, bundle);
+            if (options.Mode == "uninstall") result = Uninstall(root, bundle,
+                options.NoAssociationUpdate ? null : new HelperAssociation.RegistryStore(), NotifyAssociationChanged);
             else
             {
                 string target;
@@ -76,14 +87,20 @@ internal static class Installer
                     }
                     target = FindTarget(options, root);
                 }
-                ValidateExisting(root, bundle);
+                Receipt existing = ValidateExisting(root, bundle);
                 if (options.Mode == "check")
+                {
+                    HelperAssociation.Plan plan = options.NoAssociationUpdate ? null : InspectAssociation(
+                        new HelperAssociation.RegistryStore(), root, target, existing);
                     result = new { ok = true, mode = "check", version = bundle.Version, target = target,
                         install_dir = root, payload_files = bundle.Files.Count, native_launch_started = false,
-                        windows_settings_changed = false };
+                        windows_settings_changed = false, file_association_changed = false,
+                        file_association_status = plan == null ? "disabled" : plan.Status,
+                        file_association_would_change = plan != null && plan.Changes };
+                }
                 else
                 {
-                    installed = Install(root, target, bundle, options.NoShortcuts);
+                    installed = Install(root, target, bundle, options.NoShortcuts, !options.NoAssociationUpdate);
                     result = installed;
                 }
             }
@@ -94,7 +111,8 @@ internal static class Installer
         catch (Exception error)
         {
             if (headless) WriteJson(new { ok = false, error = error.Message,
-                native_launch_started = false, windows_settings_changed = false });
+                native_launch_started = false, windows_settings_changed = error is AssociationRecoveryException,
+                association_recovery_required = error is AssociationRecoveryException });
             else MessageBox.Show(error.Message + "\r\n\r\nНастройки защиты и языка Windows не изменялись.",
                 "FASTMEAN — русский интерфейс", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
@@ -120,6 +138,7 @@ internal static class Installer
             { result.Mode = arg.Substring(2); modes++; }
             else if (arg == "--json") result.JsonOutput = true;
             else if (arg == "--no-shortcuts") result.NoShortcuts = true;
+            else if (arg == "--no-association-update") result.NoAssociationUpdate = true;
             else if (arg == "--app-dir" || arg == "--destination")
             {
                 if (++index >= args.Length) throw new ArgumentException("Missing value for " + arg);
@@ -268,6 +287,15 @@ internal static class Installer
             if (!names.Add(file.name) || file.sha256 == null || file.sha256.Length != 64)
                 throw new IOException("Invalid installation receipt.");
         }
+        if (receipt.association != null && (!HelperAssociation.ValidReceipt(receipt.association) ||
+            receipt.association.installed.text != HelperAssociation.Command(Path.Combine(root, "FastmeanRuRunner.exe"))))
+            throw new IOException("Invalid helper association ownership receipt.");
+        if (receipt.association_backup != null)
+        {
+            if (!receipt.association_backup.StartsWith("association-backups/", StringComparison.Ordinal))
+                throw new IOException("Invalid helper association backup path.");
+            OwnedPath(root, receipt.association_backup);
+        }
         return receipt;
     }
 
@@ -298,13 +326,30 @@ internal static class Installer
 
     private static InstallResult Install(string root, string target, Bundle bundle, bool noShortcuts)
     {
-        return Install(root, target, bundle, noShortcuts, File.Copy);
+        return Install(root, target, bundle, noShortcuts, true);
+    }
+
+    private static InstallResult Install(string root, string target, Bundle bundle, bool noShortcuts,
+        bool updateAssociation)
+    {
+        return InstallCore(root, target, bundle, noShortcuts, File.Copy,
+            updateAssociation ? new HelperAssociation.RegistryStore() : null, NotifyAssociationChanged);
     }
 
     private static InstallResult Install(string root, string target, Bundle bundle, bool noShortcuts,
         Action<string, string, bool> copyFile)
     {
+        // File-transaction fault-injection seam: no real registry in tests.
+        return InstallCore(root, target, bundle, noShortcuts, copyFile, null, delegate { });
+    }
+
+    private static InstallResult InstallCore(string root, string target, Bundle bundle, bool noShortcuts,
+        Action<string, string, bool> copyFile, HelperAssociation.IStore associationStore, Action notifyAssociation)
+    {
         Receipt previous = ValidateExisting(root, bundle);
+        HelperAssociation.Plan associationPlan = associationStore == null ? null :
+            InspectAssociation(associationStore, root, target, previous);
+        HelperAssociation.Applied associationApplied = null;
         Dictionary<string, byte[]> files = new Dictionary<string, byte[]>(bundle.Files, StringComparer.OrdinalIgnoreCase);
         files.Add("FASTMEAN_EXE.txt", new UTF8Encoding(false).GetBytes(target + "\r\n"));
         string parent = Path.GetDirectoryName(root);
@@ -326,7 +371,9 @@ internal static class Installer
             }
             Receipt receipt = new Receipt { owner = Owner, version = bundle.Version, target = target,
                 shortcut = previous == null ? null : previous.shortcut,
-                shortcut_sha256 = previous == null ? null : previous.shortcut_sha256 };
+                shortcut_sha256 = previous == null ? null : previous.shortcut_sha256,
+                association = previous == null ? null : previous.association,
+                association_backup = previous == null ? null : previous.association_backup };
             List<Entry> declarations = new List<Entry>();
             foreach (KeyValuePair<string, byte[]> file in files)
                 declarations.Add(new Entry { name = file.Key, size = file.Value.Length, sha256 = Hash(file.Value) });
@@ -354,13 +401,43 @@ internal static class Installer
                 try { CreateShortcut(root, receipt); }
                 catch (Exception error) { shortcutError = DescribeError(error); }
             }
+            if (associationStore != null)
+            {
+                associationApplied = HelperAssociation.Apply(associationStore, associationPlan, delegate(HelperAssociation.Receipt backup) {
+                    receipt.association_backup = SaveAssociationBackup(root, backup);
+                });
+                receipt.association = associationApplied.Ownership;
+            }
             File.WriteAllText(Path.Combine(root, ReceiptName), Json.Serialize(receipt), new UTF8Encoding(false));
+            bool associationChanged = associationApplied != null && associationApplied.Changed;
+            // Replacing an EXE can also change its icon while its command is
+            // already current. Refresh the shell's icon cache on every install.
+            notifyAssociation();
             return new InstallResult { version = bundle.Version, install_dir = root,
                 helper = Path.Combine(root, "FastmeanRuRunner.exe"), target = target,
-                shortcut = receipt.shortcut, shortcut_error = shortcutError };
+                shortcut = receipt.shortcut, shortcut_error = shortcutError,
+                file_association_changed = associationChanged, windows_settings_changed = associationChanged,
+                file_association_status = associationChanged ? "updated_existing_helper" :
+                    associationPlan == null ? "disabled" : associationPlan.Status,
+                association_backup = receipt.association_backup == null ? null : OwnedPath(root, receipt.association_backup) };
         }
-        catch
+        catch (Exception installError)
         {
+            if (installError is HelperAssociation.RecoveryException)
+                throw new AssociationRecoveryException("Не удалось подтвердить откат привязки .scm. " +
+                    "Новый помощник и резервная копия в association-backups сохранены для восстановления.", installError);
+            if (associationApplied != null && associationApplied.Changed)
+            {
+                try { if (HelperAssociation.Rollback(associationStore, associationApplied)) notifyAssociation(); }
+                catch (Exception rollbackError)
+                {
+                    // Keep the new helper available if Windows may still point
+                    // at it. The durable backup was saved before the write.
+                    throw new AssociationRecoveryException("Не удалось завершить откат привязки .scm. " +
+                        "Файлы помощника и резервная копия в association-backups сохранены. " +
+                        installError.Message, rollbackError);
+                }
+            }
             if (!newRoot)
             {
                 foreach (string path in replaced)
@@ -386,6 +463,37 @@ internal static class Installer
         }
     }
 
+    private static HelperAssociation.Plan InspectAssociation(HelperAssociation.IStore store,
+        string root, string target, Receipt previous)
+    {
+        return HelperAssociation.Inspect(store, Path.Combine(root, "FastmeanRuRunner.exe"), target,
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            previous == null ? new string[0] : new string[] { Path.Combine(root, "FastmeanRuRunner.exe") },
+            previous == null ? null : previous.association);
+    }
+
+    private static string SaveAssociationBackup(string root, HelperAssociation.Receipt backup)
+    {
+        string relative = "association-backups/" + Guid.NewGuid().ToString("N") + ".json";
+        string path = OwnedPath(root, relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        using (FileStream stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            byte[] data = new UTF8Encoding(false).GetBytes(Json.Serialize(backup));
+            stream.Write(data, 0, data.Length);
+            stream.Flush(true);
+        }
+        return relative;
+    }
+
+    [DllImport("shell32.dll")]
+    private static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+
+    private static void NotifyAssociationChanged()
+    {
+        SHChangeNotify(0x08000000, 0x1000, IntPtr.Zero, IntPtr.Zero);
+    }
+
     private static void CreateShortcut(string root, Receipt receipt)
     {
         CreateShortcut(root, receipt, Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
@@ -402,15 +510,24 @@ internal static class Installer
         }
         NoLinks(shortcut);
         string helper = Path.Combine(root, "FastmeanRuRunner.exe");
-        UnicodeShortcut.Save(shortcut, helper, root, "FASTMEAN — русский интерфейс и ввод");
+        UnicodeShortcut.Save(shortcut, helper, root, "FASTMEAN — русский интерфейс и ввод",
+            AppBranding.PreferredShortcutIcon(receipt.target, helper));
         receipt.shortcut = shortcut;
         receipt.shortcut_sha256 = FileHash(shortcut);
     }
 
     private static object Uninstall(string root, Bundle bundle)
     {
+        return Uninstall(root, bundle, new HelperAssociation.RegistryStore(), NotifyAssociationChanged);
+    }
+
+    private static object Uninstall(string root, Bundle bundle, HelperAssociation.IStore store, Action notifyAssociation)
+    {
         Receipt receipt = ReadReceipt(root);
         if (receipt == null) return new { ok = true, status = "not_installed", install_dir = root };
+        bool associationRestored = store != null && HelperAssociation.Restore(store, receipt.association);
+        if (associationRestored) notifyAssociation();
+        if (store != null) receipt.association = null;
         List<string> removed = new List<string>(), preserved = new List<string>();
         HashSet<string> allowed = new HashSet<string>(bundle.Files.Keys, StringComparer.OrdinalIgnoreCase);
         allowed.Add("FASTMEAN_EXE.txt");
@@ -430,6 +547,7 @@ internal static class Installer
             { NoLinks(receipt.shortcut); File.Delete(receipt.shortcut); }
         }
         if (preserved.Count == 0) File.Delete(Path.Combine(root, ReceiptName));
+        else File.WriteAllText(Path.Combine(root, ReceiptName), Json.Serialize(receipt), new UTF8Encoding(false));
         // Remove empty owned subdirectories only. Unknown/user files stay put.
         foreach (Entry file in receipt.files)
         {
@@ -443,7 +561,8 @@ internal static class Installer
         }
         if (Directory.GetFileSystemEntries(root).Length == 0) Directory.Delete(root);
         return new { ok = true, status = "uninstalled", install_dir = root, removed_files = removed.Count,
-            preserved_modified_files = preserved, windows_settings_changed = false, native_launch_started = false };
+            preserved_modified_files = preserved, windows_settings_changed = associationRestored,
+            file_association_changed = associationRestored, native_launch_started = false };
     }
 
     private static string DescribeError(Exception error)
@@ -454,6 +573,11 @@ internal static class Installer
 
     private static string CompletionText(string root, string shortcut, string shortcutError)
     {
+        return CompletionText(root, shortcut, shortcutError, null);
+    }
+
+    private static string CompletionText(string root, string shortcut, string shortcutError, string associationStatus)
+    {
         string launch;
         if (!String.IsNullOrEmpty(shortcutError))
             launch = "Ярлык на рабочем столе создать не удалось.\r\n" + shortcutError +
@@ -462,38 +586,56 @@ internal static class Installer
             launch = "Открывайте FASTMEAN через запускатель:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe");
         else
             launch = "Открывайте FASTMEAN через ярлык на рабочем столе:\r\n" + shortcut;
+        string association = associationStatus == "updated_existing_helper" ?
+            "Существующая привязка .scm обновлена на новый русский запускатель." :
+            associationStatus == "already_current" ? ".scm уже открываются через этот русский запускатель." :
+            "Для открытия .scm по умолчанию выберите:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe");
         return "Готово. Русский запускатель установлен.\r\n\r\n" + launch +
-            "\r\n\r\nДля открытия .scm по умолчанию выберите:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe") +
+            "\r\n\r\n" + association +
             "\r\n\r\nПеред запуском сохраните работу и закройте прежнее окно FASTMEAN.";
     }
 
     private static void ShowCompletion(string root, Bundle bundle, InstallResult installed)
     {
         Application.EnableVisualStyles();
+        using (Icon logo = AppBranding.LoadIcon(installed.target, 32))
+        using (Bitmap headerImage = AppBranding.LoadHeaderImage(installed.target, 64))
+        using (Font headingFont = new Font(SystemFonts.MessageBoxFont.FontFamily, 16, FontStyle.Bold))
         using (Form form = new Form())
         {
             form.Text = "FASTMEAN — русский интерфейс";
-            form.ClientSize = new Size(560, 360);
+            form.Icon = logo;
+            form.ClientSize = new Size(600, 420);
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.MaximizeBox = false;
             form.StartPosition = FormStartPosition.CenterScreen;
+            PictureBox brand = new PictureBox { Left = 24, Top = 20, Width = 64, Height = 64,
+                Image = headerImage, SizeMode = PictureBoxSizeMode.Zoom };
+            Label heading = new Label { Left = 104, Top = 24, Width = 470, Height = 32,
+                Text = "FASTMEAN", Font = headingFont };
+            Label subtitle = new Label { Left = 106, Top = 59, Width = 460, Height = 24,
+                Text = "Русский интерфейс · версия " + installed.version };
             TextBox text = new TextBox { ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Vertical,
                 BorderStyle = BorderStyle.None, BackColor = SystemColors.Control,
-                Left = 24, Top = 20, Width = 510, Height = 260,
-                Text = CompletionText(root, installed.shortcut, installed.shortcut_error) };
-            Button open = new Button { Text = "Открыть FASTMEAN", Left = 24, Top = 305, Width = 160, Height = 34 };
+                TabStop = false, AccessibleName = "Результат установки",
+                Left = 24, Top = 108, Width = 552, Height = 240,
+                Text = CompletionText(root, installed.shortcut, installed.shortcut_error, installed.file_association_status) };
+            Button open = new Button { Text = "Открыть FASTMEAN", Left = 24, Top = 368, Width = 170, Height = 34 };
             open.Click += delegate {
                 Process.Start(new ProcessStartInfo(Path.Combine(root, "FastmeanRuRunner.exe")) { WorkingDirectory = root });
                 form.Close();
             };
-            Button uninstall = new Button { Text = "Удалить", Left = 205, Top = 305, Width = 110, Height = 34 };
+            Button uninstall = new Button { Text = "Удалить", Left = 214, Top = 368, Width = 100, Height = 34 };
             uninstall.Click += delegate {
                 try { Uninstall(root, bundle); MessageBox.Show("Русский запускатель удалён. Файлы FASTMEAN и пользовательские схемы сохранены."); form.Close(); }
                 catch (Exception error) { MessageBox.Show(error.Message); }
             };
-            Button close = new Button { Text = "Закрыть", Left = 425, Top = 305, Width = 110, Height = 34 };
+            Button close = new Button { Text = "Закрыть", Left = 466, Top = 368, Width = 110, Height = 34 };
             close.Click += delegate { form.Close(); };
-            form.Controls.AddRange(new Control[] { text, open, uninstall, close });
+            form.Controls.AddRange(new Control[] { brand, heading, subtitle, text, open, uninstall, close });
+            form.AcceptButton = close;
+            form.CancelButton = close;
+            form.ActiveControl = close;
             form.ShowDialog();
         }
     }

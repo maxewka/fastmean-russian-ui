@@ -14,6 +14,8 @@ import tempfile
 import urllib.request
 import zipfile
 
+from assets.make_icon import icon_bytes
+
 ROOT = Path(__file__).resolve().parent
 RUNTIME_URL = "https://github.com/xupefei/Locale-Emulator/releases/download/v2.5.0.1/Locale.Emulator.2.5.0.1.zip"
 RUNTIME_SHA256 = "808ff584426d52cc775ad6406da00622f454be95bd4c8fbca42eef4b7235ad5c"
@@ -67,7 +69,7 @@ def archive(files: dict[str, bytes]) -> bytes:
 def own_sources() -> dict[str, bytes]:
     names = {"README.md", "LICENSE", "NOTICE.md", "AGENTS.md", "THIRD_PARTY.md", ".gitignore", "build.py"}
     paths = [ROOT / name for name in names if (ROOT / name).is_file()]
-    for folder in ("src", "licenses", "docs", "tests", ".github"):
+    for folder in ("src", "licenses", "docs", "tests", ".github", "assets"):
         paths.extend(p for p in (ROOT / folder).rglob("*") if p.is_file()
                      and "__pycache__" not in p.parts and p.suffix not in {".pyc", ".exe", ".dll"})
     return {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in paths}
@@ -106,7 +108,7 @@ def upstream_sources(cache: Path) -> tuple[dict[str, bytes], dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
-    parser.add_argument("--version", default="1.0.0")
+    parser.add_argument("--version", default="1.0.1")
     parser.add_argument("--runtime-archive", type=Path)
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
@@ -142,6 +144,8 @@ def main() -> None:
     source_zip = archive(sources)
     with tempfile.TemporaryDirectory(prefix="fastmean-russianui-build-") as temporary:
         stage = Path(temporary)
+        icon_path = stage / "FastmeanRussianUI.ico"
+        icon_path.write_bytes(icon_bytes())
         assembly_info = stage / "AssemblyInfo.cs"
         assembly_info.write_text('using System.Reflection;\n'
             '[assembly: AssemblyTitle("FASTMEAN Russian UI")]\n'
@@ -151,6 +155,7 @@ def main() -> None:
         runner = stage / "FastmeanRuRunner.exe"
         subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x86", "/optimize+",
                         "/reference:System.Windows.Forms.dll", "/out:" + str(runner),
+                        "/win32icon:" + str(icon_path),
                         "/win32manifest:" + str(ROOT / "src/FastmeanRuRunner.manifest"),
                         str(ROOT / "src/FastmeanRuRunner.cs"), str(ROOT / "src/FastmeanLaunchPaths.cs"), str(assembly_info)], check=True)
         payload = {"FastmeanRuRunner.exe": runner.read_bytes()}
@@ -178,9 +183,12 @@ def main() -> None:
                         "/reference:System.Web.Extensions.dll", "/reference:System.IO.Compression.dll",
                         "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(installer),
                         "/win32manifest:" + str(ROOT / "src/FastmeanRuRunner.manifest"),
+                        "/win32icon:" + str(icon_path),
+                        "/resource:" + str(icon_path) + ",FastmeanRussianUI.Branding.Icon",
                         "/resource:" + str(payload_path) + ",FastmeanRussianUI.Payload",
                         str(ROOT / "src/Installer.cs"), str(ROOT / "src/FastmeanLaunchPaths.cs"),
-                        str(ROOT / "src/UnicodeShortcut.cs"), str(assembly_info)], check=True)
+                        str(ROOT / "src/UnicodeShortcut.cs"), str(ROOT / "src/AppBranding.cs"),
+                        str(ROOT / "src/HelperAssociation.cs"), str(assembly_info)], check=True)
     (output / "FASTMEAN-RussianUI-Source.zip").write_bytes(source_zip)
     products = [installer, output / "FASTMEAN-RussianUI-Source.zip"]
     (output / "SHA256SUMS.txt").write_text("".join(digest(p.read_bytes()) + "  " + p.name + "\n" for p in products), encoding="ascii")

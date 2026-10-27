@@ -24,7 +24,7 @@ jobs:
       - name: Run resolver and installer checks without native FASTMEAN
         run: python -m unittest discover -s tests -v
       - name: Build the licensed release installer and source bundle
-        run: python build.py --output dist --version 1.0.0
+        run: python build.py --output dist --version 1.0.1
       - uses: actions/upload-artifact@v6
         with:
           name: FASTMEAN-RussianUI-Setup

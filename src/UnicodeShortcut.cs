@@ -40,6 +40,11 @@ internal static class UnicodeShortcut
 
     internal static void Save(string shortcut, string target, string workingDirectory, string description)
     {
+        Save(shortcut, target, workingDirectory, description, target);
+    }
+
+    internal static void Save(string shortcut, string target, string workingDirectory, string description, string iconPath)
+    {
         object instance = new ShellLink();
         try
         {
@@ -47,6 +52,7 @@ internal static class UnicodeShortcut
             link.SetPath(target);
             link.SetWorkingDirectory(workingDirectory);
             link.SetDescription(description);
+            link.SetIconLocation(iconPath, 0);
             // Framework's IPersistFile marshals its filename as LPCOLESTR (UTF-16).
             ((IPersistFile)instance).Save(shortcut, true);
         }
