@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+local/
+.cache/
+*.exe
+*.dll
+*.zip
+*.scm
+*.pdf
+*.log
+*.lnk
+FASTMEAN_EXE.txt
