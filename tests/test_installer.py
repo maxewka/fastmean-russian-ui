@@ -21,6 +21,80 @@ PROJECT = Path(__file__).resolve().parents[1]
 POLICY_ERRORS = {4551, 577, 1260}
 EXE_FIXTURE = b"private resolver fixture, not a native executable"
 SCM_FIXTURE = b"private original circuit fixture; never rewrite these bytes"
+MANAGED_HARNESS = r'''
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Web.Script.Serialization;
+
+internal static class ManagedHarness
+{
+    private static object Call(string name, params object[] args)
+    {
+        return typeof(Installer).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static)
+            .Invoke(null, args);
+    }
+
+    public static int Main(string[] args)
+    {
+        object result;
+        if (args[0] == "diagnostics")
+        {
+            Exception wrapped = new TargetInvocationException(new TargetInvocationException(
+                new COMException("Desktop write denied", unchecked((int)0x80070005))));
+            string message = (string)Call("DescribeError", wrapped);
+            result = new { ok = true, message = message,
+                failure = (string)Call("CompletionText", args[1], null, message),
+                without_shortcut = (string)Call("CompletionText", args[1], null, null),
+                success = (string)Call("CompletionText", args[1], "private-desktop-shortcut.lnk", null) };
+        }
+        else
+        {
+            Type bundleType = typeof(Installer).GetNestedType("Bundle", BindingFlags.NonPublic);
+            object bundle = Activator.CreateInstance(bundleType, true);
+            bundleType.GetField("Version", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(bundle, "9.0.0");
+            var files = (Dictionary<string, byte[]>)bundleType.GetField("Files", BindingFlags.NonPublic | BindingFlags.Instance)
+                .GetValue(bundle);
+            files.Add("FastmeanRuRunner.exe", Encoding.UTF8.GetBytes("replacement fixture, never execute"));
+            files.Add("LoaderDll.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
+            files.Add("LocaleEmulator.dll", Encoding.UTF8.GetBytes("replacement fixture, never load"));
+            bool partialWrite = false;
+            Action<string, string, bool> copier = delegate(string source, string destination, bool overwrite)
+            {
+                if (Path.GetFileName(destination) == "LoaderDll.dll")
+                {
+                    File.WriteAllText(destination, "partially copied bytes");
+                    partialWrite = true;
+                    throw new IOException("deliberate partial-copy failure");
+                }
+                File.Copy(source, destination, overwrite);
+            };
+            MethodInfo install = null;
+            foreach (MethodInfo method in typeof(Installer).GetMethods(BindingFlags.NonPublic | BindingFlags.Static))
+                if (method.Name == "Install" && method.GetParameters().Length == 5) install = method;
+            if (install == null) throw new Exception("Transactional copy entry point not found");
+            try
+            {
+                install.Invoke(null, new object[] { args[1], args[2], bundle, true, copier });
+                throw new Exception("Partial-copy failure unexpectedly succeeded");
+            }
+            catch (TargetInvocationException error)
+            {
+                if (!(error.InnerException is IOException) || error.InnerException.Message != "deliberate partial-copy failure")
+                    throw;
+            }
+            if (!partialWrite) throw new Exception("The partial write was not reached");
+            result = new { ok = true, partial_write_reached = partialWrite };
+        }
+        using (var writer = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)))
+            writer.WriteLine(new JavaScriptSerializer().Serialize(result));
+        return 0;
+    }
+}
+'''
 
 
 def sha256(data: bytes) -> str:
@@ -310,6 +384,54 @@ class InstallerTests(unittest.TestCase):
         before = snapshot(self.destination)
         error = self.run_cli(self.options(), expected=1, executable=executable)
         self.assertIn(conflict.name, error["error"])
+        self.assertEqual(snapshot(self.destination), before)
+        self.assertFalse(list(self.case.glob(".fastmean-russian-ui-*")))
+
+    def compile_managed_harness(self):
+        folder = self.case / "managed-harness"
+        folder.mkdir()
+        source = folder / "ManagedHarness.cs"
+        source.write_text(MANAGED_HARNESS, encoding="utf-8")
+        executable = folder / "ManagedHarness.exe"
+        command = [str(self.compiler), "/nologo", "/target:exe", "/platform:x86", "/main:ManagedHarness",
+            "/reference:System.Windows.Forms.dll", "/reference:System.Drawing.dll",
+            "/reference:System.Web.Extensions.dll", "/reference:System.IO.Compression.dll",
+            "/reference:System.IO.Compression.FileSystem.dll", "/out:" + str(executable),
+            str(source), str(PROJECT / "src/Installer.cs"), str(PROJECT / "src/FastmeanLaunchPaths.cs")]
+        try:
+            compiled = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
+        except OSError as error:
+            if getattr(error, "winerror", None) in POLICY_ERRORS:
+                message = "Windows policy blocked ordinary harness compilation: " + str(error)
+                type(self).execution_policy_block = message
+                self.skipTest(message)
+            raise
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        return executable
+
+    def test_shortcut_failure_reports_inner_hresult_and_honest_completion_without_com(self):
+        executable = self.compile_managed_harness()
+        before = snapshot(self.case)
+        result = self.run_cli(["diagnostics", self.destination], executable=executable)
+        self.assertIn("Desktop write denied", result["message"])
+        self.assertIn("HRESULT 0x80070005", result["message"])
+        self.assertNotIn("target of an invocation", result["message"])
+        self.assertIn("создать не удалось", result["failure"])
+        self.assertIn(result["message"], result["failure"])
+        self.assertIn(str(self.destination / "FastmeanRuRunner.exe"), result["failure"])
+        self.assertNotIn("через ярлык", result["failure"])
+        self.assertNotIn("через ярлык", result["without_shortcut"])
+        self.assertIn("private-desktop-shortcut.lnk", result["success"])
+        self.assertNotIn("создать не удалось", result["success"])
+        self.assertEqual(snapshot(self.case), before)
+
+    def test_partial_copy_failure_restores_the_failing_file_and_all_previous_changes(self):
+        self.install()
+        executable = self.compile_managed_harness()
+        before = snapshot(self.destination)
+        result = self.run_cli(["rollback", self.destination, self.target], executable=executable)
+        self.assertIs(result["partial_write_reached"], True)
         self.assertEqual(snapshot(self.destination), before)
         self.assertFalse(list(self.case.glob(".fastmean-russian-ui-*")))
 

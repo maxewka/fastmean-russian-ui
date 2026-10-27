@@ -40,6 +40,12 @@ internal static class Installer
         internal string Version;
         internal Dictionary<string, byte[]> Files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
     }
+    private sealed class InstallResult
+    {
+        public bool ok = true, file_association_changed = false,
+            windows_settings_changed = false, native_launch_started = false;
+        public string status = "installed", version, install_dir, helper, target, shortcut, shortcut_error;
+    }
 
     [STAThread]
     private static int Main(string[] args)
@@ -51,6 +57,7 @@ internal static class Installer
             Bundle bundle = ReadBundle();
             string root = InstallRoot(options.Destination);
             object result;
+            InstallResult installed = null;
             if (options.Mode == "uninstall") result = Uninstall(root, bundle);
             else
             {
@@ -70,14 +77,18 @@ internal static class Installer
                     target = FindTarget(options, root);
                 }
                 ValidateExisting(root, bundle);
-                result = options.Mode == "check"
-                    ? (object)new { ok = true, mode = "check", version = bundle.Version, target = target,
+                if (options.Mode == "check")
+                    result = new { ok = true, mode = "check", version = bundle.Version, target = target,
                         install_dir = root, payload_files = bundle.Files.Count, native_launch_started = false,
-                        windows_settings_changed = false }
-                    : Install(root, target, bundle, options.NoShortcuts);
+                        windows_settings_changed = false };
+                else
+                {
+                    installed = Install(root, target, bundle, options.NoShortcuts);
+                    result = installed;
+                }
             }
             if (options.JsonOutput || headless) WriteJson(result);
-            if (options.Interactive && options.Mode == "install") ShowCompletion(root, bundle);
+            if (options.Interactive && installed != null) ShowCompletion(root, bundle, installed);
             return 0;
         }
         catch (Exception error)
@@ -285,7 +296,13 @@ internal static class Installer
         return receipt;
     }
 
-    private static object Install(string root, string target, Bundle bundle, bool noShortcuts)
+    private static InstallResult Install(string root, string target, Bundle bundle, bool noShortcuts)
+    {
+        return Install(root, target, bundle, noShortcuts, File.Copy);
+    }
+
+    private static InstallResult Install(string root, string target, Bundle bundle, bool noShortcuts,
+        Action<string, string, bool> copyFile)
     {
         Receipt previous = ValidateExisting(root, bundle);
         Dictionary<string, byte[]> files = new Dictionary<string, byte[]>(bundle.Files, StringComparer.OrdinalIgnoreCase);
@@ -324,8 +341,10 @@ internal static class Installer
                     Directory.CreateDirectory(Path.GetDirectoryName(path));
                     if (File.Exists(path)) backups[path] = File.ReadAllBytes(path);
                     else newlyCreated.Add(path);
-                    File.Copy(OwnedPath(stage, file.Key), path, true);
+                    // A failed copy may already have truncated its destination.
+                    // Register it before writing so rollback also restores it.
                     replaced.Add(path);
+                    copyFile(OwnedPath(stage, file.Key), path, true);
                 }
                 File.Copy(Path.Combine(stage, ReceiptName), Path.Combine(root, ReceiptName), true);
             }
@@ -333,13 +352,12 @@ internal static class Installer
             if (!noShortcuts)
             {
                 try { CreateShortcut(root, receipt); }
-                catch (Exception error) { shortcutError = error.Message; }
+                catch (Exception error) { shortcutError = DescribeError(error); }
             }
             File.WriteAllText(Path.Combine(root, ReceiptName), Json.Serialize(receipt), new UTF8Encoding(false));
-            return new { ok = true, status = "installed", version = bundle.Version, install_dir = root,
+            return new InstallResult { version = bundle.Version, install_dir = root,
                 helper = Path.Combine(root, "FastmeanRuRunner.exe"), target = target,
-                shortcut = receipt.shortcut, shortcut_error = shortcutError,
-                file_association_changed = false, windows_settings_changed = false, native_launch_started = false };
+                shortcut = receipt.shortcut, shortcut_error = shortcutError };
         }
         catch
         {
@@ -431,30 +449,52 @@ internal static class Installer
             preserved_modified_files = preserved, windows_settings_changed = false, native_launch_started = false };
     }
 
-    private static void ShowCompletion(string root, Bundle bundle)
+    private static string DescribeError(Exception error)
+    {
+        Exception cause = error.GetBaseException();
+        return cause.Message + " (HRESULT 0x" + cause.HResult.ToString("X8") + ")";
+    }
+
+    private static string CompletionText(string root, string shortcut, string shortcutError)
+    {
+        string launch;
+        if (!String.IsNullOrEmpty(shortcutError))
+            launch = "Ярлык на рабочем столе создать не удалось.\r\n" + shortcutError +
+                "\r\n\r\nОткрывайте FASTMEAN через запускатель:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe");
+        else if (String.IsNullOrEmpty(shortcut))
+            launch = "Открывайте FASTMEAN через запускатель:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe");
+        else
+            launch = "Открывайте FASTMEAN через ярлык на рабочем столе:\r\n" + shortcut;
+        return "Готово. Русский запускатель установлен.\r\n\r\n" + launch +
+            "\r\n\r\nДля открытия .scm по умолчанию выберите:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe") +
+            "\r\n\r\nПеред запуском сохраните работу и закройте прежнее окно FASTMEAN.";
+    }
+
+    private static void ShowCompletion(string root, Bundle bundle, InstallResult installed)
     {
         Application.EnableVisualStyles();
         using (Form form = new Form())
         {
             form.Text = "FASTMEAN — русский интерфейс";
-            form.ClientSize = new Size(560, 255);
+            form.ClientSize = new Size(560, 360);
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.MaximizeBox = false;
             form.StartPosition = FormStartPosition.CenterScreen;
-            Label text = new Label { AutoSize = false, Left = 24, Top = 20, Width = 510, Height = 145,
-                Text = "Готово. Русский запускатель установлен.\r\n\r\nОткрывайте FASTMEAN через новый ярлык на рабочем столе.\r\nДля открытия .scm по умолчанию выберите:\r\n" + Path.Combine(root, "FastmeanRuRunner.exe") +
-                    "\r\n\r\nПеред запуском сохраните работу и закройте прежнее окно FASTMEAN." };
-            Button open = new Button { Text = "Открыть FASTMEAN", Left = 24, Top = 190, Width = 160, Height = 34 };
+            TextBox text = new TextBox { ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Vertical,
+                BorderStyle = BorderStyle.None, BackColor = SystemColors.Control,
+                Left = 24, Top = 20, Width = 510, Height = 260,
+                Text = CompletionText(root, installed.shortcut, installed.shortcut_error) };
+            Button open = new Button { Text = "Открыть FASTMEAN", Left = 24, Top = 305, Width = 160, Height = 34 };
             open.Click += delegate {
                 Process.Start(new ProcessStartInfo(Path.Combine(root, "FastmeanRuRunner.exe")) { WorkingDirectory = root });
                 form.Close();
             };
-            Button uninstall = new Button { Text = "Удалить", Left = 205, Top = 190, Width = 110, Height = 34 };
+            Button uninstall = new Button { Text = "Удалить", Left = 205, Top = 305, Width = 110, Height = 34 };
             uninstall.Click += delegate {
                 try { Uninstall(root, bundle); MessageBox.Show("Русский запускатель удалён. Файлы FASTMEAN и пользовательские схемы сохранены."); form.Close(); }
                 catch (Exception error) { MessageBox.Show(error.Message); }
             };
-            Button close = new Button { Text = "Закрыть", Left = 425, Top = 190, Width = 110, Height = 34 };
+            Button close = new Button { Text = "Закрыть", Left = 425, Top = 305, Width = 110, Height = 34 };
             close.Click += delegate { form.Close(); };
             form.Controls.AddRange(new Control[] { text, open, uninstall, close });
             form.ShowDialog();
